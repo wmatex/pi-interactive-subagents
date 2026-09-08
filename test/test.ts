@@ -220,6 +220,21 @@ const TOOL_RESULT = {
 
 // --- Tests ---
 
+describe("subagent session storage", () => {
+  it("stores child sessions outside Pi's normal session picker root", () => {
+    withTempDir((agentDir) => {
+      const cwd = join(agentDir, "workspace");
+      mkdirSync(cwd);
+
+      const sessionDir = subagentsModule.getSubagentSessionDirFor(cwd, agentDir);
+
+      assert.ok(sessionDir.startsWith(join(agentDir, "subagent-sessions") + "/"));
+      assert.equal(existsSync(join(agentDir, "sessions")), false);
+      assert.equal(existsSync(sessionDir), true);
+    });
+  });
+});
+
 describe("session.ts", () => {
   let dir: string;
 

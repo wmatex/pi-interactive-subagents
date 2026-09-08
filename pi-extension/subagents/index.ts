@@ -348,9 +348,9 @@ function resolveSubagentPaths(
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
+export function getSubagentSessionDirFor(cwd: string, agentDir: string): string {
   const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  const sessionDir = join(agentDir, "sessions", safePath);
+  const sessionDir = join(agentDir, "subagent-sessions", safePath);
   if (!existsSync(sessionDir)) {
     mkdirSync(sessionDir, { recursive: true });
   }
@@ -1187,7 +1187,7 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const sessionDir = getSubagentSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
