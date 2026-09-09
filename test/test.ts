@@ -1266,6 +1266,14 @@ describe("subagent discovery", () => {
         writeFileSync(join(nodeModules, "pi-plain", "package.json"), JSON.stringify({ name: "pi-plain" }));
         writeFileSync(join(nodeModules, "pi-plain", "index.js"), "module.exports = () => ({});\n");
 
+        // Loaded into every sub-agent without being declared.
+        mkdirSync(join(nodeModules, "pi-sandbox"), { recursive: true });
+        writeFileSync(
+          join(nodeModules, "pi-sandbox", "package.json"),
+          JSON.stringify({ name: "pi-sandbox", pi: { extensions: ["./index.ts"] } }),
+        );
+        writeFileSync(join(nodeModules, "pi-sandbox", "index.ts"), "export default () => ({});\n");
+
         run(agentDir);
       });
     }
@@ -1364,9 +1372,29 @@ describe("subagent discovery", () => {
           "researcher",
         );
         assert.deepEqual(resolved, [
+          // Always-loaded default first, then the agent's own declarations.
+          join(agentDir, "npm", "node_modules", "pi-sandbox", "index.ts"),
           join(agentDir, "extensions", "local-file.ts"),
           join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
         ]);
+      });
+    });
+
+    it("always loads pi-sandbox, even for an agent that declares nothing", () => {
+      withExtensionFixture((agentDir) => {
+        const sandbox = join(agentDir, "npm", "node_modules", "pi-sandbox", "index.ts");
+        assert.deepEqual(testApi.resolveAgentExtensions(undefined, agentDir, "scout"), [sandbox]);
+        assert.deepEqual(testApi.resolveAgentExtensions([], agentDir, "scout"), [sandbox]);
+        // An agent naming it explicitly doesn't get it twice.
+        assert.deepEqual(testApi.resolveAgentExtensions(["pi-sandbox"], agentDir, "scout"), [sandbox]);
+      });
+    });
+
+    it("skips an always-loaded extension that isn't installed", () => {
+      // A bare agent dir: pi-sandbox is absent, which must not fail the spawn
+      // the way a missing *declared* extension does.
+      withTempDir((agentDir) => {
+        assert.deepEqual(testApi.resolveAgentExtensions(undefined, agentDir, "scout"), []);
       });
     });
 
@@ -1380,12 +1408,6 @@ describe("subagent discovery", () => {
       });
     });
 
-    it("resolveAgentExtensions is a no-op for an agent declaring none", () => {
-      withExtensionFixture((agentDir) => {
-        assert.deepEqual(testApi.resolveAgentExtensions(undefined, agentDir, "scout"), []);
-        assert.deepEqual(testApi.resolveAgentExtensions([], agentDir, "scout"), []);
-      });
-    });
 
     it("parses the extensions frontmatter key into a list", async () => {
       await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -1397,19 +1419,6 @@ describe("subagent discovery", () => {
         const loaded = testApi.loadAgentDefaults("ext-test-agent");
         assert.ok(loaded, "expected agent to load");
         assert.deepEqual(loaded.extensions, ["pi-web-access", "pi-sandbox"]);
-      });
-    });
-
-    it("parses the YAML inline-sequence form of the extensions key", async () => {
-      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-        writeAgentFile(
-          projectAgentsDir,
-          "ext-yaml-agent",
-          ["name: ext-yaml-agent", 'extensions: [pi-sandbox, "pi-fff"]'].join("\n"),
-        );
-        const loaded = testApi.loadAgentDefaults("ext-yaml-agent");
-        assert.ok(loaded, "expected agent to load");
-        assert.deepEqual(loaded.extensions, ["pi-sandbox", "pi-fff"]);
       });
     });
 

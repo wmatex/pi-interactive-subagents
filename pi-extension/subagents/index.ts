@@ -121,11 +121,12 @@ interface AgentDefaults {
   model?: string;
   tools?: string;
   /**
-   * pi extensions to load into the child process, by package name, local
-   * extension name, or path. Independent of `tools`: `tools` is the strict
-   * allowlist of callable tool names, `extensions` decides which extension
-   * files are loaded back in after `--no-extensions`. A tool is only usable
-   * when both name it.
+   * pi extensions to load into the child process, as a comma-separated list of
+   * package names, local extension names, or paths. Independent of `tools`:
+   * `tools` is the strict allowlist of callable tool names, `extensions`
+   * decides which extension files are loaded back in after `--no-extensions`.
+   * A tool is only usable when both name it. `ALWAYS_LOADED_EXTENSIONS` are
+   * added on top of whatever this lists.
    */
   extensions?: string[];
   skills?: string;
@@ -392,10 +393,21 @@ function resolveExtensionSource(source: string, agentDir = getAgentConfigDir()):
 }
 
 /**
- * Resolve every extension an agent declared, failing loudly on the first name
- * that resolves to nothing. A sub-agent launched without the extension backing
- * its tools burns an entire task before the omission is noticed, so this is a
- * spawn-time error rather than a warning.
+ * Extensions loaded into every sub-agent without being declared, so agent
+ * definitions don't have to repeat them. Resolved best-effort: unlike an
+ * agent's own `extensions:` entries, a missing one here is skipped rather than
+ * failing the spawn — an implicit default that isn't installed shouldn't break
+ * agents that never asked for it.
+ */
+const ALWAYS_LOADED_EXTENSIONS = ["pi-sandbox"] as const;
+
+/**
+ * Resolve every extension a sub-agent should launch with: the always-loaded
+ * defaults first (best-effort), then the agent's own declarations.
+ *
+ * A declared entry that resolves to nothing fails loudly — a sub-agent
+ * launched without the extension backing its tools burns an entire task before
+ * the omission is noticed, so that's a spawn-time error rather than a warning.
  */
 function resolveAgentExtensions(
   sources: string[] | undefined,
@@ -403,6 +415,15 @@ function resolveAgentExtensions(
   agentName: string | undefined,
 ): string[] {
   const resolved: string[] = [];
+
+  // Defaults go first so they form the base layer an agent's own extensions
+  // load on top of.
+  for (const source of ALWAYS_LOADED_EXTENSIONS) {
+    for (const entry of resolveExtensionSource(source, agentDir)) {
+      if (!resolved.includes(entry)) resolved.push(entry);
+    }
+  }
+
   for (const source of sources ?? []) {
     const entries = resolveExtensionSource(source, agentDir);
     if (entries.length === 0) {
@@ -445,19 +466,10 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
-/**
- * Parse a comma-separated frontmatter value into a trimmed list (or undefined).
- * Accepts both the bare form (`a, b`) and YAML inline-sequence form
- * (`[a, b]`, `["a", "b"]`), since agent definitions in the wild use either.
- */
+/** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
 function parseCommaList(value: string | undefined): string[] | undefined {
   if (value == null) return undefined;
-  let raw = value.trim();
-  if (raw.startsWith("[") && raw.endsWith("]")) raw = raw.slice(1, -1);
-  const list = raw
-    .split(",")
-    .map((s) => s.trim().replace(/^["']|["']$/g, "").trim())
-    .filter(Boolean);
+  const list = value.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? list : undefined;
 }
 

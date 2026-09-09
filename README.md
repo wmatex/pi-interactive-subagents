@@ -112,7 +112,7 @@ You are a specialized agent that does X...
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Anything else is extension-backed and needs the providing extension named in `extensions` |
-| `extensions` | string | Comma-separated pi extensions to load into the child. Accepts `a, b` or `[a, b]`. Resolved to concrete files at spawn time; an unresolvable name fails the spawn (see [Extensions](#extensions)) |
+| `extensions` | string | Comma-separated pi extensions to load into the child. Resolved to concrete files at spawn time; an unresolvable name fails the spawn (see [Extensions](#extensions)) |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -158,6 +158,8 @@ Extensions can register additional tools for sub-agents at runtime via `register
 tools: web_search, fetch_content, safe_bash
 extensions: pi-web-access
 ```
+
+`pi-sandbox` is loaded into every sub-agent automatically — no agent needs to list it. It is resolved best-effort: if it isn't installed it is skipped, rather than failing agents that never asked for it. Declaring it explicitly is harmless (it won't load twice).
 
 pi's `-e` flag takes a filesystem path and nothing else — it does no `node_modules` lookup — so each entry is resolved to a concrete file at spawn time, in this order:
 
