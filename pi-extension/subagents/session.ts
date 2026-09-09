@@ -106,6 +106,15 @@ export interface SubagentLoadout {
   systemPromptMode: "append" | "replace" | null;
   /** The system-prompt/identity text, only when it lived in the system prompt. */
   identity: string | null;
+  /**
+   * Absolute paths of the extension files the subagent was launched with,
+   * resolved from its `extensions:` frontmatter at spawn time. Stored resolved
+   * (rather than as the declared names) so resume replays the exact same
+   * extension set even if the agent definition or the install tree changed.
+   * Empty for agents that declare no extensions; absent in sidecars written
+   * before this field existed, which resume treats as empty.
+   */
+  extensionPaths: string[];
   /** Agents this subagent was allowed to spawn (for PI_SUBAGENT_ALLOWED). */
   spawnable: string[] | null;
   /** Whether the agent auto-exits (informational; resume forces autonomous). */
@@ -138,7 +147,15 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    // Sidecars written before `extensionPaths` existed simply carry no agent
+    // extensions — normalize so callers never have to null-check the field.
+    const extensionPaths = (parsed as SubagentLoadout).extensionPaths;
+    return {
+      ...(parsed as SubagentLoadout),
+      extensionPaths: Array.isArray(extensionPaths)
+        ? extensionPaths.filter((entry): entry is string => typeof entry === "string")
+        : [],
+    };
   } catch {
     return null;
   }

@@ -11,6 +11,7 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -119,6 +120,14 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 interface AgentDefaults {
   model?: string;
   tools?: string;
+  /**
+   * pi extensions to load into the child process, by package name, local
+   * extension name, or path. Independent of `tools`: `tools` is the strict
+   * allowlist of callable tool names, `extensions` decides which extension
+   * files are loaded back in after `--no-extensions`. A tool is only usable
+   * when both name it.
+   */
+  extensions?: string[];
   skills?: string;
   thinking?: string;
   /**
@@ -208,28 +217,207 @@ export function registerToolExtension(name: string, extensionPath: string): void
  * registers it. Used to build the child's `--extension` whitelist after
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).
+ *
+ * This only knows about extensions THIS package owns: the spawning toolset
+ * (registered by this very file) and the bundled `safe_bash`. Every other
+ * extension-backed tool comes from an agent's explicit `extensions:`
+ * frontmatter (see `resolveExtensionSource`) or a runtime
+ * `registerToolExtension` call — there is no implicit tool→extension guessing.
  */
 function getToolExtensionPath(tool: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
+  // The spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
-  const extBase = join(getAgentConfigDir(), "extensions");
-  const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
-    video_extract: join(extBase, "video-extract", "index.ts"),
-    youtube_search: join(extBase, "youtube-search", "index.ts"),
-    google_image_search: join(extBase, "google-image-search", "index.ts"),
-    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
-  };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
-  const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
+  // Prefer the bundled path, but fall back to a runtime-registered extension
+  // when that path no longer exists on disk (e.g. the bundled tool file was
+  // removed but a project-local extension re-registered the name).
+  if (tool === "safe_bash") {
+    const bundled = join(SUBAGENTS_DIR, "tools", "safe-bash.ts");
+    if (existsSync(bundled)) return bundled;
+  }
   return EXTRA_TOOL_EXTENSIONS.get(tool);
+}
+
+// ── Agent-declared extensions (`extensions:` frontmatter) ───────────────────
+// pi's `-e` flag takes a filesystem path and nothing else: under
+// `--no-extensions` the CLI values go straight to `loadExtension`, which does a
+// plain `resolvePath(input, cwd)` join with no node_modules lookup and no
+// package-manifest expansion. So a bare package name like `pi-web-access` must
+// be resolved to a concrete entry FILE here before it can be handed to a child.
+
+/** True for an `extensions:` entry that already names a filesystem path. */
+function isExtensionPathLike(source: string): boolean {
+  // A scoped package name (`@scope/pkg`) contains a slash but is NOT a path.
+  if (source.startsWith("@")) return false;
+  return (
+    source.startsWith("/") ||
+    source.startsWith("~") ||
+    source.startsWith(".") ||
+    source.includes("/") ||
+    source.endsWith(".ts") ||
+    source.endsWith(".js")
+  );
+}
+
+/**
+ * Candidate filesystem locations for a path-like entry, in priority order.
+ * An anchored path (`/…`, `~/…`, `./…`) means exactly one place. An unanchored
+ * one (`git-check.ts`, `todo/index.ts`) is tried against the agent dir and then
+ * its `extensions/` subdir, so naming a local extension with its file suffix
+ * works the same as naming it without.
+ */
+function extensionPathCandidates(source: string, agentDir: string): string[] {
+  if (source === "~") return [homedir()];
+  if (source.startsWith("~/")) return [join(homedir(), source.slice(2))];
+  if (source.startsWith("/") || source.startsWith(".")) return [resolve(agentDir, source)];
+  return [resolve(agentDir, source), resolve(agentDir, "extensions", source)];
+}
+
+/**
+ * Entry files for an installed pi package directory, mirroring pi's own
+ * `resolveExtensionEntries`: the `pi.extensions` manifest entries when present,
+ * else `index.ts` / `index.js`. Returns an empty list when nothing resolves.
+ */
+function packageExtensionEntries(packageDir: string): string[] {
+  const manifestPath = join(packageDir, "package.json");
+  if (existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      const declared = manifest?.pi?.extensions;
+      if (Array.isArray(declared)) {
+        const entries = declared
+          .filter((entry: unknown): entry is string => typeof entry === "string")
+          .map((entry: string) => resolve(packageDir, entry))
+          .filter((entry: string) => existsSync(entry));
+        if (entries.length > 0) return entries;
+      }
+    } catch {
+      // Unparseable manifest — fall through to the index.* convention.
+    }
+  }
+  for (const index of ["index.ts", "index.js"]) {
+    const candidate = join(packageDir, index);
+    if (existsSync(candidate)) return [candidate];
+  }
+  return [];
+}
+
+/**
+ * Find an installed package directory by name. Tries the literal directory
+ * first, then scans for a package whose manifest `name` matches — so a scoped
+ * package can also be declared by its unscoped tail (`pi-fff` finds
+ * `@ff-labs/pi-fff`), which is how agent definitions in the wild name them.
+ */
+function findInstalledPackageDir(nodeModules: string, name: string): string | undefined {
+  const direct = join(nodeModules, name);
+  if (existsSync(direct)) return direct;
+  if (!existsSync(nodeModules)) return undefined;
+
+  const candidates: string[] = [];
+  try {
+    for (const entry of readdirSync(nodeModules, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith("@")) {
+        const scopeDir = join(nodeModules, entry.name);
+        try {
+          for (const scoped of readdirSync(scopeDir, { withFileTypes: true })) {
+            if (scoped.isDirectory() || scoped.isSymbolicLink()) candidates.push(join(scopeDir, scoped.name));
+          }
+        } catch {
+          // Unreadable scope dir — skip it.
+        }
+      } else {
+        candidates.push(join(nodeModules, entry.name));
+      }
+    }
+  } catch {
+    return undefined;
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(candidate, "package.json"), "utf8"));
+      if (manifest?.name === name || manifest?.name?.endsWith(`/${name}`)) return candidate;
+    } catch {
+      // No/!readable manifest — not the package we're after.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve one `extensions:` frontmatter entry to the extension file(s) a child
+ * pi process can be launched with via `-e`.
+ *
+ * Order: path-like entries pass through (with `~` expanded and relatives taken
+ * against `agentDir`), then `<agentDir>/extensions/<name>.ts`, then
+ * `<agentDir>/extensions/<name>/`, then the installed package
+ * `<agentDir>/npm/node_modules/<name>`.
+ *
+ * Returns an empty array when nothing resolves — callers turn that into a
+ * spawn failure rather than launching an agent silently missing its tools.
+ */
+function resolveExtensionSource(source: string, agentDir = getAgentConfigDir()): string[] {
+  const trimmed = source.trim();
+  if (!trimmed) return [];
+
+  if (isExtensionPathLike(trimmed)) {
+    for (const candidate of extensionPathCandidates(trimmed, agentDir)) {
+      if (!existsSync(candidate)) continue;
+      // A directory still needs manifest/index expansion — `-e` does none.
+      return statSync(candidate).isDirectory() ? packageExtensionEntries(candidate) : [candidate];
+    }
+    return [];
+  }
+
+  const extensionDir = join(agentDir, "extensions");
+  const localFile = join(extensionDir, `${trimmed}.ts`);
+  if (existsSync(localFile)) return [localFile];
+
+  const localDir = join(extensionDir, trimmed);
+  if (existsSync(localDir)) {
+    const entries = packageExtensionEntries(localDir);
+    if (entries.length > 0) return entries;
+  }
+
+  const packageDir = findInstalledPackageDir(join(agentDir, "npm", "node_modules"), trimmed);
+  if (packageDir) {
+    const entries = packageExtensionEntries(packageDir);
+    if (entries.length > 0) return entries;
+  }
+
+  return [];
+}
+
+/**
+ * Resolve every extension an agent declared, failing loudly on the first name
+ * that resolves to nothing. A sub-agent launched without the extension backing
+ * its tools burns an entire task before the omission is noticed, so this is a
+ * spawn-time error rather than a warning.
+ */
+function resolveAgentExtensions(
+  sources: string[] | undefined,
+  agentDir: string,
+  agentName: string | undefined,
+): string[] {
+  const resolved: string[] = [];
+  for (const source of sources ?? []) {
+    const entries = resolveExtensionSource(source, agentDir);
+    if (entries.length === 0) {
+      const who = agentName ? `agent "${agentName}"` : "this spawn";
+      throw new Error(
+        `Cannot resolve extension "${source}" declared by ${who}. ` +
+          `Looked in ${join(agentDir, "extensions")} and ${join(agentDir, "npm", "node_modules")}. ` +
+          `Install it (\`pi install npm:${source}\`), or give an explicit path in the agent's \`extensions:\` frontmatter.`,
+      );
+    }
+    for (const entry of entries) {
+      if (!resolved.includes(entry)) resolved.push(entry);
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -257,10 +445,19 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
-/** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
+/**
+ * Parse a comma-separated frontmatter value into a trimmed list (or undefined).
+ * Accepts both the bare form (`a, b`) and YAML inline-sequence form
+ * (`[a, b]`, `["a", "b"]`), since agent definitions in the wild use either.
+ */
 function parseCommaList(value: string | undefined): string[] | undefined {
   if (value == null) return undefined;
-  const list = value.split(",").map((s) => s.trim()).filter(Boolean);
+  let raw = value.trim();
+  if (raw.startsWith("[") && raw.endsWith("]")) raw = raw.slice(1, -1);
+  const list = raw
+    .split(",")
+    .map((s) => s.trim().replace(/^["']|["']$/g, "").trim())
+    .filter(Boolean);
   return list.length > 0 ? list : undefined;
 }
 
@@ -284,6 +481,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
     tools: getFrontmatterValue(frontmatter, "tools"),
+    extensions: parseCommaList(getFrontmatterValue(frontmatter, "extensions")),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
@@ -869,6 +1067,11 @@ function applySandboxToParts(
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
+    // Extensions the agent declared via `extensions:`, already resolved to
+    // concrete files at spawn time.
+    for (const extPath of loadout.extensionPaths ?? []) {
+      if (existsSync(extPath)) extPaths.add(extPath);
+    }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
@@ -1134,6 +1337,8 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  resolveExtensionSource,
+  resolveAgentExtensions,
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
@@ -1186,6 +1391,17 @@ async function launchSubagent(
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+
+  // Resolve the agent's declared extensions against the config dir the CHILD
+  // will see, so a cwd-local .pi/agent/ resolves its own installs. Done before
+  // any pane is created: an unresolvable extension fails the spawn outright
+  // rather than leaving an orphan surface behind.
+  const extensionPaths = resolveAgentExtensions(
+    agentDefs?.extensions,
+    effectiveAgentDir,
+    params.agent,
+  );
+
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getSubagentSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1345,6 +1561,7 @@ async function launchSubagent(
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
+    extensionPaths,
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,

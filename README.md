@@ -77,10 +77,12 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+
+`researcher` and `worker` declare `extensions: pi-web-access` for their web tools. If that package isn't installed (`pi install npm:pi-web-access`), spawning them fails with an explicit error rather than starting an agent that can't search — drop the web tools and the `extensions` line from a project-local copy to use them without it.
 
 ## Custom agents
 
@@ -93,6 +95,7 @@ description: Does something specific
 model: openrouter/z-ai/glm-5.3
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
+extensions: pi-web-access
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -108,7 +111,8 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Anything else is extension-backed and needs the providing extension named in `extensions` |
+| `extensions` | string | Comma-separated pi extensions to load into the child. Accepts `a, b` or `[a, b]`. Resolved to concrete files at spawn time; an unresolvable name fails the spawn (see [Extensions](#extensions)) |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -140,11 +144,33 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions the agent declares are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
 Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+
+### Extensions
+
+`tools` and `extensions` are independent: `tools` is the allowlist of callable tool names, `extensions` decides which extension files are loaded back in after `--no-extensions`. A tool is only usable when **both** name it.
+
+```markdown
+tools: web_search, fetch_content, safe_bash
+extensions: pi-web-access
+```
+
+pi's `-e` flag takes a filesystem path and nothing else — it does no `node_modules` lookup — so each entry is resolved to a concrete file at spawn time, in this order:
+
+1. An explicit path (absolute, `~/…`, `./…`, or anything containing `/`), with relatives taken against the agent config dir. A directory is expanded like a package.
+2. `<agentDir>/extensions/<name>.ts`
+3. `<agentDir>/extensions/<name>/` → its `package.json` `pi.extensions` entries, else `index.ts` / `index.js`
+4. `<agentDir>/npm/node_modules/<name>` → same expansion. A scoped package may be named by its unscoped tail: `pi-fff` finds `@ff-labs/pi-fff`.
+
+Resolution happens against the config dir the **child** will see, so an agent with a `cwd` containing its own `.pi/agent/` resolves that directory's installs.
+
+A name that resolves to nothing **fails the spawn** with an error naming the extension and the agent — no pane is created. A sub-agent that silently starts without the extension backing its tools would otherwise burn an entire task before the omission is noticed.
+
+The resolved paths are recorded in the loadout snapshot, so a resume replays exactly the extension set the original spawn used.
 
 ## Role folders
 

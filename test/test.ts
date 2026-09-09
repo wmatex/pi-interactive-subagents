@@ -346,6 +346,7 @@ describe("session.ts", () => {
       thinking: "medium",
       systemPromptMode: "append",
       identity: "You are a worker agent.",
+      extensionPaths: ["/home/u/.pi/agent/npm/node_modules/pi-web-access/index.ts"],
       spawnable: ["scout", "researcher"],
       autoExit: true,
       cwd: "/work/dir",
@@ -1221,13 +1222,239 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
+  it("getToolExtensionPath maps this package's own tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    // Tools backed by third-party extensions are NOT guessed — they come from
+    // an agent's explicit `extensions:` frontmatter.
+    assert.equal(testApi.getToolExtensionPath("web_search"), undefined);
+    assert.equal(testApi.getToolExtensionPath("fetch_content"), undefined);
+  });
+
+  describe("extension resolution", () => {
+    /** Build an agent dir with local extensions and installed packages. */
+    function withExtensionFixture(run: (agentDir: string) => void) {
+      withTempDir((agentDir) => {
+        const extDir = join(agentDir, "extensions");
+        mkdirSync(join(extDir, "local-dir"), { recursive: true });
+        writeFileSync(join(extDir, "local-file.ts"), "export default () => ({});\n");
+        writeFileSync(join(extDir, "local-dir", "index.ts"), "export default () => ({});\n");
+
+        const nodeModules = join(agentDir, "npm", "node_modules");
+        // Unscoped package declaring its entry via the pi manifest.
+        mkdirSync(join(nodeModules, "pi-web-access"), { recursive: true });
+        writeFileSync(
+          join(nodeModules, "pi-web-access", "package.json"),
+          JSON.stringify({ name: "pi-web-access", pi: { extensions: ["./index.ts"] } }),
+        );
+        writeFileSync(join(nodeModules, "pi-web-access", "index.ts"), "export default () => ({});\n");
+
+        // Scoped package whose entry is NOT at the root, and which declares two.
+        mkdirSync(join(nodeModules, "@ff-labs", "pi-fff", "src"), { recursive: true });
+        writeFileSync(
+          join(nodeModules, "@ff-labs", "pi-fff", "package.json"),
+          JSON.stringify({ name: "@ff-labs/pi-fff", pi: { extensions: ["src/index.ts", "src/extra.ts"] } }),
+        );
+        writeFileSync(join(nodeModules, "@ff-labs", "pi-fff", "src", "index.ts"), "export default () => ({});\n");
+        writeFileSync(join(nodeModules, "@ff-labs", "pi-fff", "src", "extra.ts"), "export default () => ({});\n");
+
+        // Package with no pi manifest — falls back to the index.* convention.
+        mkdirSync(join(nodeModules, "pi-plain"), { recursive: true });
+        writeFileSync(join(nodeModules, "pi-plain", "package.json"), JSON.stringify({ name: "pi-plain" }));
+        writeFileSync(join(nodeModules, "pi-plain", "index.js"), "module.exports = () => ({});\n");
+
+        run(agentDir);
+      });
+    }
+
+    it("resolves a local extension file by bare name", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("local-file", agentDir), [
+          join(agentDir, "extensions", "local-file.ts"),
+        ]);
+      });
+    });
+
+    it("resolves a local extension directory to its index", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("local-dir", agentDir), [
+          join(agentDir, "extensions", "local-dir", "index.ts"),
+        ]);
+      });
+    });
+
+    it("resolves an installed package to the entry file from its pi manifest", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("pi-web-access", agentDir), [
+          join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+        ]);
+      });
+    });
+
+    it("resolves a scoped package, including a manifest with several entries", () => {
+      withExtensionFixture((agentDir) => {
+        const base = join(agentDir, "npm", "node_modules", "@ff-labs", "pi-fff", "src");
+        assert.deepEqual(testApi.resolveExtensionSource("@ff-labs/pi-fff", agentDir), [
+          join(base, "index.ts"),
+          join(base, "extra.ts"),
+        ]);
+      });
+    });
+
+    it("finds a scoped package by its unscoped tail", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("pi-fff", agentDir), [
+          join(agentDir, "npm", "node_modules", "@ff-labs", "pi-fff", "src", "index.ts"),
+          join(agentDir, "npm", "node_modules", "@ff-labs", "pi-fff", "src", "extra.ts"),
+        ]);
+      });
+    });
+
+    it("falls back to index.js for a package with no pi manifest", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("pi-plain", agentDir), [
+          join(agentDir, "npm", "node_modules", "pi-plain", "index.js"),
+        ]);
+      });
+    });
+
+    it("passes an explicit path through, resolving relatives against the agent dir", () => {
+      withExtensionFixture((agentDir) => {
+        const absolute = join(agentDir, "extensions", "local-file.ts");
+        assert.deepEqual(testApi.resolveExtensionSource(absolute, agentDir), [absolute]);
+        assert.deepEqual(testApi.resolveExtensionSource("./extensions/local-file.ts", agentDir), [absolute]);
+      });
+    });
+
+    it("resolves an unanchored path against the agent dir's extensions folder", () => {
+      withExtensionFixture((agentDir) => {
+        // Naming a local extension WITH its suffix works like naming it without.
+        assert.deepEqual(testApi.resolveExtensionSource("local-file.ts", agentDir), [
+          join(agentDir, "extensions", "local-file.ts"),
+        ]);
+        assert.deepEqual(testApi.resolveExtensionSource("local-dir/index.ts", agentDir), [
+          join(agentDir, "extensions", "local-dir", "index.ts"),
+        ]);
+      });
+    });
+
+    it("expands a directory given as an explicit path", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("./extensions/local-dir", agentDir), [
+          join(agentDir, "extensions", "local-dir", "index.ts"),
+        ]);
+      });
+    });
+
+    it("returns nothing for an unknown name or a missing path", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveExtensionSource("pi-not-installed", agentDir), []);
+        assert.deepEqual(testApi.resolveExtensionSource("./extensions/nope.ts", agentDir), []);
+      });
+    });
+
+    it("resolveAgentExtensions dedupes across entries and preserves order", () => {
+      withExtensionFixture((agentDir) => {
+        const resolved = testApi.resolveAgentExtensions(
+          ["local-file", "pi-web-access", "local-file"],
+          agentDir,
+          "researcher",
+        );
+        assert.deepEqual(resolved, [
+          join(agentDir, "extensions", "local-file.ts"),
+          join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+        ]);
+      });
+    });
+
+    it("resolveAgentExtensions throws, naming the extension and the agent", () => {
+      withExtensionFixture((agentDir) => {
+        assert.throws(
+          () => testApi.resolveAgentExtensions(["pi-not-installed"], agentDir, "researcher"),
+          (err: Error) =>
+            err.message.includes("pi-not-installed") && err.message.includes("researcher"),
+        );
+      });
+    });
+
+    it("resolveAgentExtensions is a no-op for an agent declaring none", () => {
+      withExtensionFixture((agentDir) => {
+        assert.deepEqual(testApi.resolveAgentExtensions(undefined, agentDir, "scout"), []);
+        assert.deepEqual(testApi.resolveAgentExtensions([], agentDir, "scout"), []);
+      });
+    });
+
+    it("parses the extensions frontmatter key into a list", async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+        writeAgentFile(
+          projectAgentsDir,
+          "ext-test-agent",
+          ["name: ext-test-agent", "tools: web_search", "extensions: pi-web-access, pi-sandbox"].join("\n"),
+        );
+        const loaded = testApi.loadAgentDefaults("ext-test-agent");
+        assert.ok(loaded, "expected agent to load");
+        assert.deepEqual(loaded.extensions, ["pi-web-access", "pi-sandbox"]);
+      });
+    });
+
+    it("parses the YAML inline-sequence form of the extensions key", async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+        writeAgentFile(
+          projectAgentsDir,
+          "ext-yaml-agent",
+          ["name: ext-yaml-agent", 'extensions: [pi-sandbox, "pi-fff"]'].join("\n"),
+        );
+        const loaded = testApi.loadAgentDefaults("ext-yaml-agent");
+        assert.ok(loaded, "expected agent to load");
+        assert.deepEqual(loaded.extensions, ["pi-sandbox", "pi-fff"]);
+      });
+    });
+
+    it("leaves extensions undefined when the key is absent", async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+        writeAgentFile(projectAgentsDir, "no-ext-agent", ["name: no-ext-agent", "tools: read"].join("\n"));
+        const loaded = testApi.loadAgentDefaults("no-ext-agent");
+        assert.ok(loaded, "expected agent to load");
+        assert.equal(loaded.extensions, undefined);
+      });
+    });
+
+    it("applySandboxToParts emits -e for each snapshotted extension path", () => {
+      withTempDir((d) => {
+        const extA = join(d, "ext-a.ts");
+        const extB = join(d, "ext-b.ts");
+        writeFileSync(extA, "export default () => ({});\n");
+        writeFileSync(extB, "export default () => ({});\n");
+
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          {
+            agent: "researcher",
+            toolAllowlist: "web_search,fetch_content,ask_question",
+            model: null,
+            thinking: null,
+            systemPromptMode: null,
+            identity: null,
+            extensionPaths: [extA, extB, join(d, "gone.ts")],
+            spawnable: null,
+            autoExit: true,
+            cwd: null,
+            agentDir: null,
+          },
+          { artifactDir: d, name: "researcher" },
+        );
+
+        const loaded = parts.filter((_, i) => parts[i - 1] === "-e").map((p) => p.replace(/'/g, ""));
+        assert.ok(loaded.includes(extA), "expected the first declared extension");
+        assert.ok(loaded.includes(extB), "expected the second declared extension");
+        // A path that has vanished since the spawn is not passed to the child.
+        assert.ok(!loaded.some((p) => p.endsWith("gone.ts")), "expected the missing path to be skipped");
+      });
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1311,6 +1538,7 @@ describe("subagent discovery", () => {
           thinking: "medium",
           systemPromptMode: "append",
           identity: "You are a worker.",
+          extensionPaths: [],
           spawnable: ["scout"],
           autoExit: true,
           cwd: null,
@@ -1348,6 +1576,7 @@ describe("subagent discovery", () => {
           thinking: null,
           systemPromptMode: null,
           identity: null,
+          extensionPaths: [],
           spawnable: null,
           autoExit: false,
           cwd: null,
